@@ -1,12 +1,6 @@
-# Ignore Python cache
-__pycache__/
-*.pyc
-*.pyo
-
-# Ignore environment files
+.venv/
 .env
-config.yaml
-
-# Ignore logs
+__pycache__/
+*.py[cod]
 logs/
 *.log

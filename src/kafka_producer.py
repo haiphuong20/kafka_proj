@@ -1,23 +1,114 @@
-from utils.config_loader import load_config
-from utils.kafka_utils import create_kafka_producer, create_kafka_consumer
+import base64
+import json
+import logging
 
-def produce_to_local_kafka():
-    config = load_config()
-    producer = create_kafka_producer(config)
-    consumer = create_kafka_consumer(config, config["kafka"]["source_topic"])
+from utils.kafka_utils import (
+    create_consumer,
+    create_producer,
+    poll_record,
+    publish_confirmed,
+)
 
-    print(f"📡 Listening to Kafka topic: {config['kafka']['source_topic']}")
 
-    for message in consumer:
-        data = message.value
-        print(f"Producing to local Kafka: {data}")
+logger = logging.getLogger(__name__)
 
-        def on_send_success(record_metadata):
-            print(f"✅ Message sent to {record_metadata.topic} partition {record_metadata.partition}")
 
-        def on_send_error(ex):
-            print(f"Error sending message: {ex}")
+def encode_bytes(value):
+    if value is None:
+        return None
 
-        producer.send(
-            config["kafka"]["target_topic"], value=data
-        ).add_callback(on_send_success).add_errback(on_send_error)
+    return base64.b64encode(value).decode("ascii")
+
+
+def build_envelope(config, message):
+    timestamp_type, timestamp_ms = message.timestamp()
+
+    return {
+        "version": 1,
+        "source": {
+            "id": config["source_id"],
+            "topic": message.topic(),
+            "partition": message.partition(),
+            "offset": message.offset(),
+            "timestamp_type": timestamp_type,
+            "timestamp_ms": timestamp_ms,
+        },
+        "key_b64": encode_bytes(message.key()),
+        "value_b64": encode_bytes(message.value()),
+        "headers": [
+            {
+                "name": name,
+                "value_b64": encode_bytes(value),
+            }
+            for name, value in (message.headers() or [])
+        ],
+    }
+
+
+def produce_to_local_kafka(config, stop_event):
+    consumer = create_consumer(
+        config["source"],
+        config["source_group"],
+        "product-view-source-consumer",
+    )
+
+    producer = None
+
+    try:
+        producer = create_producer(config["local"])
+        consumer.subscribe([config["source_topic"]])
+
+        logger.info(
+            "Bridge started: source=%s target=%s group=%s",
+            config["source_topic"],
+            config["local_topic"],
+            config["source_group"],
+        )
+
+        while not stop_event.is_set():
+            message = poll_record(consumer)
+
+            if message is None:
+                continue
+
+            envelope = build_envelope(config, message)
+
+            delivered = publish_confirmed(
+                producer=producer,
+                topic=config["local_topic"],
+                key=message.key(),
+                value=json.dumps(
+                    envelope,
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+            )
+
+            # Commit the source offset only after successful delivery to local Kafka.
+            consumer.commit(
+                message=message,
+                asynchronous=False,
+            )
+
+            logger.info(
+                "Delivered and committed: "
+                "source=%s[%s]@%s local=%s[%s]@%s",
+                message.topic(),
+                message.partition(),
+                message.offset(),
+                delivered.topic(),
+                delivered.partition(),
+                delivered.offset(),
+            )
+
+    finally:
+        try:
+            if producer is not None:
+                remaining = producer.flush(timeout=35)
+
+                if remaining:
+                    logger.error(
+                        "Producer still has %s undelivered records",
+                        remaining,
+                    )
+        finally:
+            consumer.close()

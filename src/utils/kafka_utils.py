@@ -1,25 +1,75 @@
-from kafka import KafkaProducer, KafkaConsumer
-import json
+import time
 
-def create_kafka_producer(config):
-    return KafkaProducer(
-        bootstrap_servers=config["kafka"]["bootstrap_servers"].split(","),
-        security_protocol=config["kafka"]["security_protocol"],
-        sasl_mechanism=config["kafka"]["sasl_mechanism"],
-        sasl_plain_username=config["kafka"]["username"],
-        sasl_plain_password=config["kafka"]["password"],
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-    )
+from confluent_kafka import Consumer, KafkaException, Producer
 
-def create_kafka_consumer(config, topic):
-    return KafkaConsumer(
-        topic,
-        bootstrap_servers=config["kafka"]["bootstrap_servers"].split(","),
-        security_protocol=config["kafka"]["security_protocol"],
-        sasl_mechanism=config["kafka"]["sasl_mechanism"],
-        sasl_plain_username=config["kafka"]["username"],
-        sasl_plain_password=config["kafka"]["password"],
-        auto_offset_reset="earliest",
-        enable_auto_commit=True,
-        value_deserializer=lambda x: json.loads(x.decode("utf-8")),
-    )
+
+def create_consumer(connection, group_id, client_id):
+    return Consumer({
+        **connection,
+        "group.id": group_id,
+        "client.id": client_id,
+        "auto.offset.reset": "earliest",
+        "enable.auto.commit": False,
+        "enable.auto.offset.store": False,
+        "allow.auto.create.topics": False,
+        "max.poll.interval.ms": 300000,
+    })
+
+
+def create_producer(connection):
+    return Producer({
+        **connection,
+        "client.id": "product-view-bridge-producer",
+        "acks": "all",
+        "enable.idempotence": True,
+        "delivery.timeout.ms": 30000,
+    })
+
+
+def poll_record(consumer):
+    message = consumer.poll(timeout=1.0)
+
+    if message is None:
+        return None
+
+    if message.error():
+        raise KafkaException(message.error())
+
+    return message
+
+
+def publish_confirmed(producer, topic, key, value):
+    """Publish one record and wait for delivery confirmation."""
+    result = {}
+
+    def on_delivery(error, message):
+        result["error"] = error
+        result["message"] = message
+
+    deadline = time.monotonic() + 45
+
+    while True:
+        try:
+            producer.produce(
+                topic=topic,
+                key=key,
+                value=value,
+                on_delivery=on_delivery,
+            )
+            break
+        except BufferError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Producer queue is still full")
+
+            producer.poll(0.2)
+
+    while "error" not in result:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Timed out waiting for Kafka delivery confirmation")
+
+        producer.poll(0.2)
+
+    if result["error"] is not None:
+        raise KafkaException(result["error"])
+
+    return result["message"]
